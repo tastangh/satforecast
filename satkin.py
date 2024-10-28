@@ -1,92 +1,69 @@
 import numpy as np
-import pandas as pd
+import cudf as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
 from cuml import preprocessing
 from cuml.ensemble import RandomForestRegressor
-from cuml.metrics import r2_score, mean_squared_error, mean_absolute_error
+from cuml.metrics import r2_score
 import opendatasets as od
-import cupy as cp  # Import CuPy
 
-# Veri setini indir
+# Download the dataset
 od.download('https://www.kaggle.com/datasets/idawoodjee/predict-the-positions-and-speeds-of-600-satellites')
 
-# Verileri yükle
+# Load the data
 train = pd.read_csv('predict-the-positions-and-speeds-of-600-satellites/jan_train.csv')
 test = pd.read_csv('predict-the-positions-and-speeds-of-600-satellites/jan_test.csv')
 key = pd.read_csv('predict-the-positions-and-speeds-of-600-satellites/answer_key.csv')
 
-# Eğitim verilerini incele
+# Inspect the training data
 train.info()
+train.epoch = pd.to_datetime(train.epoch)
 
-# Tarihleri dönüştür
-train['epoch'] = pd.to_datetime(train['epoch'])
+# Prepare features and target variables
+X = train[['id', 'sat_id', 'x_sim', 'y_sim', 'z_sim', 'Vx_sim', 'Vy_sim', 'Vz_sim']].copy().astype(np.float32)
+y = train[['x', 'y', 'z', 'Vx', 'Vy', 'Vz']].astype(np.float32)
 
-# Veri görselleştirme
-sns.pairplot(train)
-plt.show()  # Show the plot
-
-# Özellikler ve hedef değişkeni ayır
-X = train[['id', 'sat_id', 'x_sim', 'y_sim', 'z_sim', 'Vx_sim', 'Vy_sim', 'Vz_sim']].copy()
-y = train[['x', 'y', 'z', 'Vx', 'Vy', 'Vz']]
-
-# Verileri ölçeklendir
+# Scale the features
 min_max_scaler = preprocessing.MinMaxScaler()
-X_scaled = min_max_scaler.fit_transform(X)
+X_scale = min_max_scaler.fit_transform(X)
 
-# Eğitim ve hedef veri boyutlarını kontrol et
-print("Scaled feature shape:", X_scaled.shape, "Target shape:", y.shape)
+# Separate targets
+Y_train = y
 
-# Hedef değişkenleri ayır
-Y_train = [cp.asarray(y.iloc[:, i].to_numpy()) for i in range(y.shape[1])]  # Convert to CuPy arrays
-
-# Random Forest Regresyon modellerini oluştur
+# Train regressors
 nstreams = 25
-regressors = [RandomForestRegressor(n_estimators=200, max_features=(3 if i < 4 else 4), n_streams=nstreams) for i in range(6)]
-
-# Modelleri eğit
+regressors = []
 for i in range(6):
-    regressors[i].fit(X_scaled, Y_train[i])
-
-# Test verisini ön işleme tabi tut
-X_test = test[['id', 'sat_id', 'x_sim', 'y_sim', 'z_sim', 'Vx_sim', 'Vy_sim', 'Vz_sim']].copy()
-X_test_scaled = min_max_scaler.transform(X_test)
-
-# Tahmin yap
-y_preds = [regressor.predict(X_test_scaled) for regressor in regressors]
-
-# R-kare değerlerini hesapla ve RMSE ile MAE'yi hesapla
-r2_scores = []
-rmse_scores = []
-mae_scores = []
-accuracy_scores = []
-
-# Tolerans yüzdesi belirle (örneğin %5)
-tolerance = 0.05  # 5%
-
-for i in range(6):
-    y_true = cp.asarray(key.iloc[:, i].to_numpy())  # Convert to CuPy arrays
-    y_pred_cupy = cp.asarray(y_preds[i])  # Ensure y_preds is a CuPy array
-
-    r2 = r2_score(y_true, y_pred_cupy)
-    rmse = mean_squared_error(y_true, y_pred_cupy, squared=False)  # RMSE
-    mae = mean_absolute_error(y_true, y_pred_cupy)  # MAE
+    max_features = 3 if i < 4 else 4  # Different max_features for last two regressors
+    regressor = RandomForestRegressor(n_estimators=200, max_features=max_features, n_streams=nstreams)
     
-    # Accuracy hesapla
-    accurate_predictions = cp.abs(y_pred_cupy - y_true) <= (tolerance * cp.abs(y_true))
-    accuracy = cp.mean(accurate_predictions) * 100  # Yüzde olarak hesapla
+    try:
+        regressor.fit(X_scale, Y_train.iloc[:, i])
+        regressors.append(regressor)
+    except Exception as e:
+        print(f"Error training regressor {i}: {e}")
+        del regressor  # Explicitly delete the regressor to free memory
 
-    r2_scores.append(r2)
-    rmse_scores.append(rmse)
-    mae_scores.append(mae)
-    accuracy_scores.append(accuracy)
+# Preprocess test data
+test = test[['id', 'sat_id', 'x_sim', 'y_sim', 'z_sim', 'Vx_sim', 'Vy_sim', 'Vz_sim']].copy().astype(np.float32)
+X_test = min_max_scaler.fit_transform(test)
 
-# Ortak R-kare değerini hesapla
+# Make predictions
+y_preds = [regressor.predict(X_test) for regressor in regressors]
+
+# Calculate R-squared values and overall R-squared
+r2_scores = [r2_score(key.iloc[:, i].astype(np.float32), y_preds[i]) for i in range(6)]
 overall_r2 = np.mean(r2_scores)
 
-# Sonuçları yazdır
-print("R-kare değerleri:", r2_scores)
-print("RMSE değerleri:", rmse_scores)
-print("MAE değerleri:", mae_scores)
-print("Accuracy değerleri:", accuracy_scores)  # % cinsinden
-print("Genel R-kare değeri:", overall_r2)
+# Print R-squared values
+print("R-squared values:", r2_scores)
+print("Overall R-squared:", overall_r2)
+
+# Create a bar plot for R-squared values
+plt.figure(figsize=(10, 6))
+plt.bar(range(1, 7), r2_scores, color='skyblue')
+plt.xticks(range(1, 7), [f'Predictor {i+1}' for i in range(6)])
+plt.ylabel('R-squared Value')
+plt.title('R-squared Values for Each Predictor')
+plt.savefig('r_squared_plot.png')  # Save the R-squared plot
+plt.show()  # Show the R-squared plot
